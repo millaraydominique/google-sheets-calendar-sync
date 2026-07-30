@@ -288,14 +288,45 @@ function sincronizarCalendario() {
 // 4. PARSEO DE FECHAS Y RANGOS
 // ----------------------------------------------------------------------------
 
+/** Nombres de mes en español (en minúsculas, sin acentos) -> número de mes
+ *  (1-12). Se acepta "setiembre" además de "septiembre" por ser una variante
+ *  de uso común. */
+const MESES_ES = {
+  enero: 1,
+  febrero: 2,
+  marzo: 3,
+  abril: 4,
+  mayo: 5,
+  junio: 6,
+  julio: 7,
+  agosto: 8,
+  septiembre: 9,
+  setiembre: 9,
+  octubre: 10,
+  noviembre: 11,
+  diciembre: 12,
+};
+
+/** Rango de días [inicio, fin] para cada semana "ordinal" del mes usada en
+ *  expresiones como "Primera semana de agosto". */
+const SEMANAS_DEL_MES = {
+  primera: [1, 7],
+  segunda: [8, 14],
+  tercera: [15, 21],
+  cuarta: [22, 28],
+};
+
 /**
  * Interpreta el contenido de la columna Fecha en sus distintas variantes
  * reales (fecha única como objeto Date, texto "dd/mm/aaaa", rangos con
- * distintos separadores y niveles de año/mes implícito, o texto ambiguo).
+ * distintos separadores y niveles de año/mes implícito, expresiones en
+ * lenguaje natural como "Octubre" o "Primera semana de agosto", o texto
+ * ambiguo).
  *
  * @param {*} valorCrudo Valor tal cual viene de getValues().
  * @return {?{esRango: boolean, inicio: Date, finInclusive: Date}} null si la
- *   fecha es ambigua / no se pudo interpretar con certeza.
+ *   fecha es ambigua / no se pudo interpretar con certeza (por ejemplo "Por
+ *   definir", "TBD", "Pendiente" o una celda vacía).
  */
 function parsearFecha(valorCrudo) {
   if (esVacio(valorCrudo)) return null;
@@ -366,8 +397,77 @@ function parsearFecha(valorCrudo) {
     return { esRango: false, inicio, finInclusive: null };
   }
 
-  // Caso 8: cualquier otra cosa ("Por definir", "Agosto", "Octubre–Noviembre",
-  // "Primera semana de agosto", etc.) se considera ambigua y se omite.
+  // --- A partir de aquí: expresiones en lenguaje natural. Cuando la
+  // expresión no menciona año, se asume el año actual. ------------------------
+
+  // Caso 8: "Primera/Segunda/Tercera/Cuarta semana de [Mes]" [año opcional].
+  m = texto.match(/^(Primera|Segunda|Tercera|Cuarta)\s+semana\s+de\s+([A-Za-zÀ-ÿ]+)(?:\s+(\d{4}))?$/i);
+  if (m) {
+    const mes = obtenerNumeroMes(m[2]);
+    if (mes) {
+      const anio = m[3] ? Number(m[3]) : new Date().getFullYear();
+      const [diaInicio, diaFin] = SEMANAS_DEL_MES[m[1].toLowerCase()];
+      const inicio = crearFechaLocal(anio, mes, diaInicio);
+      const fin = crearFechaLocal(anio, mes, diaFin);
+      return { esRango: true, inicio, finInclusive: fin };
+    }
+  }
+
+  // Caso 9: "Mediados de [Mes]" [año opcional] -> días 11 al 20.
+  m = texto.match(/^Mediados\s+de\s+([A-Za-zÀ-ÿ]+)(?:\s+(\d{4}))?$/i);
+  if (m) {
+    const mes = obtenerNumeroMes(m[1]);
+    if (mes) {
+      const anio = m[2] ? Number(m[2]) : new Date().getFullYear();
+      const inicio = crearFechaLocal(anio, mes, 11);
+      const fin = crearFechaLocal(anio, mes, 20);
+      return { esRango: true, inicio, finInclusive: fin };
+    }
+  }
+
+  // Caso 10: "Finales de [Mes]" / "Fin de [Mes]" [año opcional] -> día 21 al
+  // último día del mes.
+  m = texto.match(/^(Finales|Fin)\s+de\s+([A-Za-zÀ-ÿ]+)(?:\s+(\d{4}))?$/i);
+  if (m) {
+    const mes = obtenerNumeroMes(m[2]);
+    if (mes) {
+      const anio = m[3] ? Number(m[3]) : new Date().getFullYear();
+      const inicio = crearFechaLocal(anio, mes, 21);
+      const fin = crearFechaLocal(anio, mes, ultimoDiaDelMes(anio, mes));
+      return { esRango: true, inicio, finInclusive: fin };
+    }
+  }
+
+  // Caso 11: rango de meses completos, ej. "Octubre–Noviembre",
+  // "Octubre-Noviembre 2026" -> desde el día 1 del primer mes hasta el
+  // último día del segundo mes.
+  m = texto.match(/^([A-Za-zÀ-ÿ]+)\s*[-–]\s*([A-Za-zÀ-ÿ]+)(?:\s+(\d{4}))?$/i);
+  if (m) {
+    const mesInicio = obtenerNumeroMes(m[1]);
+    const mesFin = obtenerNumeroMes(m[2]);
+    if (mesInicio && mesFin) {
+      const anio = m[3] ? Number(m[3]) : new Date().getFullYear();
+      const inicio = crearFechaLocal(anio, mesInicio, 1);
+      const fin = crearFechaLocal(anio, mesFin, ultimoDiaDelMes(anio, mesFin));
+      return { esRango: true, inicio, finInclusive: fin };
+    }
+  }
+
+  // Caso 12: mes completo, ej. "Octubre", "Septiembre 2027" -> desde el día 1
+  // hasta el último día de ese mes.
+  m = texto.match(/^([A-Za-zÀ-ÿ]+)(?:\s+(\d{4}))?$/i);
+  if (m) {
+    const mes = obtenerNumeroMes(m[1]);
+    if (mes) {
+      const anio = m[2] ? Number(m[2]) : new Date().getFullYear();
+      const inicio = crearFechaLocal(anio, mes, 1);
+      const fin = crearFechaLocal(anio, mes, ultimoDiaDelMes(anio, mes));
+      return { esRango: true, inicio, finInclusive: fin };
+    }
+  }
+
+  // Caso 13: cualquier otra cosa ("Por definir", "TBD", "Pendiente", texto no
+  // reconocido, etc.) se considera ambigua y se omite.
   return null;
 }
 
@@ -377,6 +477,20 @@ function parsearFecha(valorCrudo) {
  */
 function crearFechaLocal(anio, mes, dia) {
   return new Date(Number(anio), Number(mes) - 1, Number(dia));
+}
+
+/** Convierte un nombre de mes en español (cualquier combinación de
+ *  mayúsculas/minúsculas) a su número de mes (1-12), o null si el texto no
+ *  corresponde a un mes válido. */
+function obtenerNumeroMes(nombre) {
+  if (!nombre) return null;
+  return MESES_ES[nombre.trim().toLowerCase()] || null;
+}
+
+/** Día del mes correspondiente al último día de {anio}-{mes} (mes 1-indexado,
+ *  igual que en el resto del script: enero = 1, diciembre = 12). */
+function ultimoDiaDelMes(anio, mes) {
+  return new Date(Number(anio), Number(mes), 0).getDate();
 }
 
 // ----------------------------------------------------------------------------
