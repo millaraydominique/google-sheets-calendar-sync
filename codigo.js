@@ -8,7 +8,15 @@
  *  Estructura esperada (fila 1 = encabezado, datos desde fila 2):
  *   A: Fecha            B: Acción / Actividad     C: Responsable
  *   D: Seguimiento      E: Relación acreditación  F: Tipo (Interna/Académica)
- *   G: Lugar de origen  H: Comentarios
+ *   G: Lugar de origen  H: Comentarios             I: ID Evento (uso interno,
+ *                                                      no editar manualmente)
+ *
+ *  La columna I la escribe el propio script para recordar qué evento de
+ *  Calendar corresponde a cada fila. Con eso se logra que:
+ *   - Si se modifica cualquier dato de una fila (incluida la fecha), el
+ *     evento existente se ACTUALIZA en vez de crear uno nuevo.
+ *   - Si una fila se elimina de la planilla, su evento en Calendar también
+ *     se elimina automáticamente en la siguiente sincronización.
  *
  *  Instalación:
  *   1. Extensiones > Apps Script en tu planilla de Google Sheets.
@@ -38,10 +46,16 @@ const COL = {
   TIPO: 6,
   LUGAR_ORIGEN: 7,
   COMENTARIOS: 8,
+  ID_EVENTO: 9,
 };
 
 const FILA_INICIO_DATOS = 2; // fila 1 = encabezado
-const NUM_COLUMNAS = 8; // A..H
+const NUM_COLUMNAS = 9; // A..I
+
+/** Clave usada en las propiedades del documento para recordar, entre
+ *  ejecuciones, qué IDs de evento fueron sincronizados por el script. Esto
+ *  es lo que permite detectar filas eliminadas y borrar su evento asociado. */
+const PROP_IDS_SINCRONIZADOS = 'EVENTOS_SINCRONIZADOS';
 
 /** Color de evento según la columna "Tipo".
  *  Ver CalendarApp.EventColor para más opciones. */
@@ -70,8 +84,9 @@ function onOpen() {
 // ----------------------------------------------------------------------------
 
 /**
- * Recorre la hoja activa, crea los eventos correspondientes en el calendario
- * y muestra un resumen al usuario al finalizar.
+ * Recorre la hoja activa, crea/actualiza los eventos correspondientes en el
+ * calendario, elimina los eventos de filas que ya no existen y muestra un
+ * resumen al usuario al finalizar.
  */
 function sincronizarCalendario() {
   const ui = SpreadsheetApp.getUi();
@@ -93,10 +108,16 @@ function sincronizarCalendario() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
   const lastRow = sheet.getLastRow();
 
+  // Asegura el encabezado de la columna interna de control.
+  if (esVacio(sheet.getRange(1, COL.ID_EVENTO).getValue())) {
+    sheet.getRange(1, COL.ID_EVENTO).setValue('ID Evento');
+  }
+
   // Contadores para el resumen final.
   const resumen = {
     creados: 0,
-    duplicados: 0,
+    actualizados: 0,
+    eliminados: 0,
     pendientes: 0,
     filasVacias: 0,
   };
@@ -106,6 +127,12 @@ function sincronizarCalendario() {
     ui.alert('Sin datos', 'La hoja activa no tiene filas de datos para procesar.', ui.ButtonSet.OK);
     return;
   }
+
+  // Registro persistente de IDs sincronizados en ejecuciones previas,
+  // usado para detectar filas eliminadas (reconciliación).
+  const propiedades = PropertiesService.getDocumentProperties();
+  const idsPrevios = JSON.parse(propiedades.getProperty(PROP_IDS_SINCRONIZADOS) || '[]');
+  const idsVistos = new Set(); // IDs que siguen existiendo en esta ejecución
 
   const datos = sheet
     .getRange(FILA_INICIO_DATOS, 1, lastRow - FILA_INICIO_DATOS + 1, NUM_COLUMNAS)
@@ -117,7 +144,9 @@ function sincronizarCalendario() {
     const accion = normalizarTexto(fila[COL.ACCION - 1]);
     const fechaCruda = fila[COL.FECHA - 1];
 
-    // Fila vacía o sin título: se omite silenciosamente.
+    // Fila vacía o sin título: se omite silenciosamente. Si tenía un evento
+    // asociado, al no agregarse a idsVistos quedará marcado como huérfano y
+    // se eliminará en la etapa de reconciliación, igual que una fila borrada.
     if (!accion && esVacio(fechaCruda)) {
       resumen.filasVacias++;
       return;
@@ -149,24 +178,46 @@ function sincronizarCalendario() {
       fila: numeroFila,
     });
 
-    // --- Prevención de duplicados + creación -----------------------------
-    const yaExiste = eventoYaExiste(calendar, accion, fechaInfo);
-
-    if (yaExiste) {
-      resumen.duplicados++;
-      return;
-    }
+    // --- Actualización o creación (reemplaza la antigua prevención de
+    //     duplicados por título/fecha, que fallaba si la fila cambiaba) -----
+    const idGuardado = normalizarTexto(fila[COL.ID_EVENTO - 1]);
+    let evento = obtenerEventoExistente(calendar, idGuardado, accion, fechaInfo);
 
     try {
-      crearEvento(calendar, accion, fechaInfo, descripcion, color);
-      resumen.creados++;
+      if (evento) {
+        actualizarEvento(evento, accion, fechaInfo, descripcion, color);
+        resumen.actualizados++;
+      } else {
+        evento = crearEvento(calendar, accion, fechaInfo, descripcion, color);
+        resumen.creados++;
+      }
+
+      idsVistos.add(evento.getId());
+      sheet.getRange(numeroFila, COL.ID_EVENTO).setValue(evento.getId());
     } catch (err) {
       // Un error puntual en una fila no debe detener el resto de la sincronización.
-      Logger.log(`Error creando evento en fila ${numeroFila}: ${err.message}`);
+      Logger.log(`Error creando/actualizando evento en fila ${numeroFila}: ${err.message}`);
       resumen.pendientes++;
-      detalleFilasPendientes.push(`Fila ${numeroFila}: error al crear evento (${err.message})`);
+      detalleFilasPendientes.push(`Fila ${numeroFila}: error al sincronizar evento (${err.message})`);
     }
   });
+
+  // --- eliminación de eventos huérfanos (filas borradas o vaciadas) ---
+  idsPrevios.forEach((id) => {
+    if (idsVistos.has(id)) return;
+    try {
+      const eventoHuerfano = calendar.getEventById(id);
+      if (eventoHuerfano) {
+        eventoHuerfano.deleteEvent();
+        resumen.eliminados++;
+      }
+    } catch (err) {
+      Logger.log(`No se pudo eliminar el evento huérfano ${id}: ${err.message}`);
+    }
+  });
+
+  // Persiste el estado actual para poder detectar eliminaciones la próxima vez.
+  propiedades.setProperty(PROP_IDS_SINCRONIZADOS, JSON.stringify(Array.from(idsVistos)));
 
   mostrarResumen(ui, resumen, detalleFilasPendientes);
 }
@@ -267,14 +318,31 @@ function crearFechaLocal(anio, mes, dia) {
 }
 
 // ----------------------------------------------------------------------------
-// 5. PREVENCIÓN DE DUPLICADOS Y CREACIÓN DE EVENTOS
+// 5. BÚSQUEDA, ACTUALIZACIÓN Y CREACIÓN DE EVENTOS
 // ----------------------------------------------------------------------------
 
 /**
- * Revisa si ya existe un evento con el mismo título en el día (o rango) dado,
- * para no volver a crearlo en re-ejecuciones del script.
+ * Intenta recuperar el evento ya asociado a la fila. Primero por el ID
+ * guardado en la columna "ID Evento" (mecanismo principal, inmune a cambios
+ * de título o fecha). Si la fila todavía no tiene ID guardado (por ejemplo,
+ * filas creadas con una versión anterior del script), se cae de vuelta a la
+ * búsqueda por título y fecha para no duplicar eventos ya existentes.
+ *
+ * @return {?CalendarEvent} el evento existente, o null si no hay ninguno.
  */
-function eventoYaExiste(calendar, titulo, fechaInfo) {
+function obtenerEventoExistente(calendar, idGuardado, titulo, fechaInfo) {
+  if (idGuardado) {
+    const evento = calendar.getEventById(idGuardado);
+    if (evento) return evento;
+  }
+  return buscarEventoPorTituloYFecha(calendar, titulo, fechaInfo);
+}
+
+/**
+ * Busca, por título y fecha/rango, un evento existente. Se usa como
+ * respaldo para filas que todavía no tienen ID Evento guardado.
+ */
+function buscarEventoPorTituloYFecha(calendar, titulo, fechaInfo) {
   let eventosExistentes;
 
   if (!fechaInfo.esRango) {
@@ -284,7 +352,7 @@ function eventoYaExiste(calendar, titulo, fechaInfo) {
     eventosExistentes = calendar.getEvents(fechaInfo.inicio, finExclusivo);
   }
 
-  return eventosExistentes.some((ev) => ev.getTitle().trim() === titulo);
+  return eventosExistentes.find((ev) => ev.getTitle().trim() === titulo) || null;
 }
 
 /**
@@ -305,6 +373,29 @@ function crearEvento(calendar, titulo, fechaInfo, descripcion, color) {
     evento = calendar.createAllDayEvent(titulo, fechaInfo.inicio, finExclusivo, {
       description: descripcion,
     });
+  }
+
+  if (color) {
+    evento.setColor(color);
+  }
+
+  return evento;
+}
+
+/**
+ * Actualiza un evento existente para reflejar los datos actuales de
+ * la fila (título, fecha/rango, descripción y color) en vez de crear uno
+ * nuevo. Es lo que resuelve el caso de "cambio un dato y me duplica el evento".
+ */
+function actualizarEvento(evento, titulo, fechaInfo, descripcion, color) {
+  evento.setTitle(titulo);
+  evento.setDescription(descripcion);
+
+  if (!fechaInfo.esRango) {
+    evento.setAllDayDate(fechaInfo.inicio);
+  } else {
+    const finExclusivo = sumarDias(fechaInfo.finInclusive, 1);
+    evento.setAllDayDates(fechaInfo.inicio, finExclusivo);
   }
 
   if (color) {
@@ -370,7 +461,8 @@ function normalizarTexto(valor) {
 function mostrarResumen(ui, resumen, detalleFilasPendientes) {
   let mensaje =
     `Eventos creados: ${resumen.creados}\n` +
-    `Omitidos por duplicado: ${resumen.duplicados}\n` +
+    `Eventos actualizados: ${resumen.actualizados}\n` +
+    `Eventos eliminados (filas borradas): ${resumen.eliminados}\n` +
     `Ignorados por fecha pendiente/inválida: ${resumen.pendientes}\n`;
 
   if (resumen.filasVacias > 0) {
