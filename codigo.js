@@ -26,12 +26,32 @@
  *  a servicios externos (la parte lenta de cualquier script de Apps Script)
  *  a un puñado por ejecución, en vez de varias por fila.
  *
+ *  Acceso multiusuario: la interacción con Calendar se hace a través del
+ *  servicio avanzado "Google Calendar API" (identificador Calendar.*) y no
+ *  a través del servicio básico CalendarApp. CalendarApp.getCalendarById()
+ *  tiene una limitación conocida de Apps Script por la cual, para un
+ *  calendario del que el usuario ejecutor no es dueño, exige de hecho un
+ *  nivel de permiso más alto que "Hacer cambios en eventos" para reconocer
+ *  el calendario, aunque ese nivel sí alcanza para leer, crear y editar
+ *  eventos vía la API. El servicio avanzado respeta el nivel de permiso real
+ *  otorgado al compartir el calendario, por lo que funciona igual sin
+ *  importar qué cuenta ejecute el script, siempre que tenga al menos permiso
+ *  de "Hacer cambios en eventos".
+ *
  *  Instalación:
  *   1. Extensiones > Apps Script en tu planilla de Google Sheets.
  *   2. Pega este archivo completo (reemplaza el contenido de Code.gs).
  *   3. Reemplaza CALENDAR_ID más abajo por el ID real del calendario.
- *   4. Guarda y recarga la planilla. Aparecerá el menú "Sincronizar
- *      Calendario". La primera ejecución pedirá autorización.
+ *   4. En el editor de Apps Script, ve a "Servicios" (ícono +) y agrega
+ *      "Google Calendar API". Debe quedar disponible con el identificador
+ *      "Calendar". Este paso es obligatorio: sin él, el script no
+ *      funcionará para ningún usuario, incluido el dueño del calendario.
+ *   5. Guarda y recarga la planilla. Aparecerá el menú "Sincronizar
+ *      Calendario". La primera ejecución de cada usuario pedirá
+ *      autorización.
+ *   6. Cada persona que vaya a ejecutar la sincronización debe tener el
+ *      calendario compartido con su cuenta con permiso de, al menos,
+ *      "Hacer cambios en eventos".
  * ============================================================================
  */
 
@@ -66,7 +86,11 @@ const NUM_COLUMNAS = 9; // A..I
 const PROP_IDS_SINCRONIZADOS = 'EVENTOS_SINCRONIZADOS';
 
 /** Color de evento según la columna "Tipo".
- *  Ver CalendarApp.EventColor para más opciones. */
+ *  Se usan las constantes de CalendarApp.EventColor porque son valores de
+ *  solo texto (no requieren acceso al calendario) y coinciden exactamente
+ *  con los valores numéricos de colorId que usa la Google Calendar API, por
+ *  lo que se pueden reutilizar directamente. Ver CalendarApp.EventColor para
+ *  más opciones. */
 const COLOR_POR_TIPO = {
   'Académica': CalendarApp.EventColor.PALE_BLUE,
   'Interna': CalendarApp.EventColor.YELLOW,
@@ -104,18 +128,17 @@ function onOpen() {
 function sincronizarCalendario() {
   const marcaInicio = Date.now();
   const ui = SpreadsheetApp.getUi();
-  let calendar;
 
   try {
-    calendar = CalendarApp.getCalendarById(CALENDAR_ID);
-    if (!calendar) {
-      throw new Error(
-        'No se encontró el calendario. Verifica que CALENDAR_ID sea correcto ' +
-        'y que la cuenta que ejecuta el script tenga acceso a él.'
-      );
-    }
+    Calendar.Calendars.get(CALENDAR_ID);
   } catch (err) {
-    ui.alert('Error de configuración', err.message, ui.ButtonSet.OK);
+    ui.alert(
+      'Error de configuración',
+      'No se encontró el calendario, o la cuenta que ejecuta el script no tiene acceso a él. ' +
+        'Verifica que CALENDAR_ID sea correcto y que el calendario esté compartido con esta cuenta ' +
+        'con permiso de al menos "Hacer cambios en eventos".\n\nDetalle técnico: ' + err.message,
+      ui.ButtonSet.OK
+    );
     return;
   }
 
@@ -202,7 +225,7 @@ function sincronizarCalendario() {
   if (filasProcesables.length > 0) {
     const timeMin = sumarDias(minFecha, -MARGEN_DIAS_CONSULTA);
     const timeMax = sumarDias(maxFecha, MARGEN_DIAS_CONSULTA + 1);
-    calendar.getEvents(timeMin, timeMax).forEach((evento) => {
+    listarEventosEnRango(CALENDAR_ID, timeMin, timeMax).forEach((evento) => {
       registrarEventoEnIndices(evento, eventosPorId, eventosPorDia);
     });
   }
@@ -226,25 +249,25 @@ function sincronizarCalendario() {
     const idGuardado = normalizarTexto(fila[COL.ID_EVENTO - 1]);
 
     try {
-      const existente = obtenerEventoExistente(calendar, eventosPorId, eventosPorDia, idGuardado, accion, fechaInfo);
+      const existente = obtenerEventoExistente(CALENDAR_ID, eventosPorId, eventosPorDia, idGuardado, accion, fechaInfo);
       let evento;
 
       if (existente) {
-        const huboCambios = actualizarEventoSiCorresponde(existente, accion, fechaInfo, descripcion, color);
-        evento = existente;
-        if (huboCambios) {
+        const resultado = actualizarEventoSiCorresponde(CALENDAR_ID, existente, accion, fechaInfo, descripcion, color);
+        evento = resultado.evento;
+        if (resultado.huboCambios) {
           resumen.actualizados++;
         } else {
           resumen.sinCambios++;
         }
       } else {
-        evento = crearEvento(calendar, accion, fechaInfo, descripcion, color);
+        evento = crearEvento(CALENDAR_ID, accion, fechaInfo, descripcion, color);
         resumen.creados++;
       }
 
       registrarEventoEnIndices(evento, eventosPorId, eventosPorDia);
-      idsVistos.add(evento.getId());
-      columnaIdEvento[indice][0] = evento.getId();
+      idsVistos.add(evento.id);
+      columnaIdEvento[indice][0] = evento.id;
     } catch (err) {
       // Un error puntual en una fila no debe detener el resto de la sincronización.
       Logger.log(`Error creando/actualizando evento en fila ${numeroFila}: ${err.message}`);
@@ -254,18 +277,11 @@ function sincronizarCalendario() {
   });
 
   // --- Eliminación de eventos huérfanos (filas borradas o vaciadas) -------
-  // Se reutiliza el índice ya cargado en memoria; solo se consulta el
-  // calendario individualmente si el evento no formaba parte del periodo
-  // recién traído (por ejemplo, si su fecha original quedó fuera del rango
-  // cubierto por los datos actuales de la planilla).
   idsPrevios.forEach((id) => {
     if (idsVistos.has(id)) return;
     try {
-      const eventoHuerfano = eventosPorId.has(id) ? eventosPorId.get(id) : calendar.getEventById(id);
-      if (eventoHuerfano) {
-        eventoHuerfano.deleteEvent();
-        resumen.eliminados++;
-      }
+      Calendar.Events.remove(CALENDAR_ID, id);
+      resumen.eliminados++;
     } catch (err) {
       Logger.log(`No se pudo eliminar el evento huérfano ${id}: ${err.message}`);
     }
@@ -496,6 +512,38 @@ function ultimoDiaDelMes(anio, mes) {
 // ----------------------------------------------------------------------------
 // 5. ÍNDICES DE EVENTOS Y OPERACIONES SOBRE EL CALENDARIO
 // ----------------------------------------------------------------------------
+//  Esta sección usa el servicio avanzado "Google Calendar API" (identificador
+//  Calendar) en vez del servicio básico CalendarApp. Ver la nota de acceso
+//  multiusuario al inicio de este archivo: es lo que permite que el script
+//  funcione igual sin importar qué cuenta lo ejecute, siempre que tenga
+//  permiso de "Hacer cambios en eventos" sobre el calendario. Recuerda
+//  habilitar el servicio en Extensiones > Apps Script > Servicios > Google
+//  Calendar API antes de ejecutar el script.
+// ----------------------------------------------------------------------------
+
+/**
+ * Trae, con paginación, todos los eventos del calendario cuyo horario cae
+ * dentro de [timeMin, timeMax).
+ */
+function listarEventosEnRango(calendarId, timeMin, timeMax) {
+  const eventos = [];
+  let pageToken = null;
+
+  do {
+    const respuesta = Calendar.Events.list(calendarId, {
+      timeMin: timeMin.toISOString(),
+      timeMax: timeMax.toISOString(),
+      singleEvents: true,
+      maxResults: 2500,
+      pageToken: pageToken || undefined,
+    });
+
+    (respuesta.items || []).forEach((evento) => eventos.push(evento));
+    pageToken = respuesta.nextPageToken || null;
+  } while (pageToken);
+
+  return eventos;
+}
 
 /**
  * Incorpora un evento a los dos índices en memoria: por ID (búsqueda directa
@@ -503,7 +551,7 @@ function ultimoDiaDelMes(anio, mes) {
  * filas que todavía no tienen ID guardado, buscando por título y fecha).
  */
 function registrarEventoEnIndices(evento, eventosPorId, eventosPorDia) {
-  eventosPorId.set(evento.getId(), evento);
+  eventosPorId.set(evento.id, evento);
 
   const rango = obtenerRangoDeDias(evento);
   if (!rango) return;
@@ -520,121 +568,124 @@ function registrarEventoEnIndices(evento, eventosPorId, eventosPorDia) {
  * ya sea de día completo o con horario, para poder indexarlo día por día.
  */
 function obtenerRangoDeDias(evento) {
-  if (evento.isAllDayEvent()) {
-    return { inicio: evento.getAllDayStartDate(), fin: evento.getAllDayEndDate() };
+  if (evento.start && evento.start.date && evento.end && evento.end.date) {
+    return {
+      inicio: parsearFechaISOaDate(evento.start.date),
+      fin: parsearFechaISOaDate(evento.end.date),
+    };
   }
 
-  const inicio = new Date(evento.getStartTime());
-  inicio.setHours(0, 0, 0, 0);
-  const fin = new Date(evento.getEndTime());
-  fin.setHours(0, 0, 0, 0);
-  fin.setDate(fin.getDate() + 1);
+  if (evento.start && evento.start.dateTime && evento.end && evento.end.dateTime) {
+    const inicio = new Date(evento.start.dateTime);
+    inicio.setHours(0, 0, 0, 0);
+    const fin = new Date(evento.end.dateTime);
+    fin.setHours(0, 0, 0, 0);
+    fin.setDate(fin.getDate() + 1);
+    return { inicio, fin };
+  }
 
-  return { inicio, fin };
+  return null;
+}
+
+/** Convierte una fecha 'aaaa-mm-dd' (formato de la Calendar API) a un Date local. */
+function parsearFechaISOaDate(fechaTexto) {
+  const partes = fechaTexto.split('-');
+  return crearFechaLocal(partes[0], partes[1], partes[2]);
 }
 
 /**
  * Recupera el evento ya asociado a la fila. Primero por el ID guardado en la
  * columna "ID Evento" (mecanismo principal, inmune a cambios de título o
  * fecha), consultando primero el índice en memoria y, solo si no aparece ahí,
- * al calendario directamente. Si la fila todavía no tiene ID guardado (por
+ * a la API directamente. Si la fila todavía no tiene ID guardado (por
  * ejemplo, filas creadas con una versión anterior del script), se recurre a
  * la búsqueda por título y fecha para no duplicar eventos ya existentes.
  *
- * @return {?CalendarEvent} el evento existente, o null si no hay ninguno.
+ * @return {?Object} el recurso del evento existente, o null si no hay ninguno.
  */
-function obtenerEventoExistente(calendar, eventosPorId, eventosPorDia, idGuardado, titulo, fechaInfo) {
+function obtenerEventoExistente(calendarId, eventosPorId, eventosPorDia, idGuardado, titulo, fechaInfo) {
   if (idGuardado) {
     if (eventosPorId.has(idGuardado)) return eventosPorId.get(idGuardado);
-    const evento = calendar.getEventById(idGuardado);
-    if (evento) return evento;
+    try {
+      return Calendar.Events.get(calendarId, idGuardado);
+    } catch (err) {
+      // El evento guardado ya no existe en el calendario; se buscará por
+      // título/fecha o se creará uno nuevo.
+    }
   }
 
   const candidatos = eventosPorDia.get(formatearClaveDia(fechaInfo.inicio)) || [];
-  return candidatos.find((ev) => ev.getTitle().trim() === titulo) || null;
+  return candidatos.find((ev) => (ev.summary || '').trim() === titulo) || null;
 }
 
 /**
  * Crea el evento de día único o de rango según corresponda, aplicando color
  * y descripción.
  */
-function crearEvento(calendar, titulo, fechaInfo, descripcion, color) {
-  let evento;
+function crearEvento(calendarId, titulo, fechaInfo, descripcion, color) {
+  const finInclusive = fechaInfo.esRango ? fechaInfo.finInclusive : fechaInfo.inicio;
+  const finExclusivo = sumarDias(finInclusive, 1);
 
-  if (!fechaInfo.esRango) {
-    evento = calendar.createAllDayEvent(titulo, fechaInfo.inicio, {
-      description: descripcion,
-    });
-  } else {
-    // createAllDayEvent usa fecha de fin EXCLUSIVA, por eso se suma 1 día
-    // a la fecha de fin inclusiva que trae la planilla.
-    const finExclusivo = sumarDias(fechaInfo.finInclusive, 1);
-    evento = calendar.createAllDayEvent(titulo, fechaInfo.inicio, finExclusivo, {
-      description: descripcion,
-    });
-  }
+  const recurso = {
+    summary: titulo,
+    description: descripcion,
+    start: { date: formatearClaveDia(fechaInfo.inicio) },
+    end: { date: formatearClaveDia(finExclusivo) },
+  };
 
   if (color) {
-    evento.setColor(color);
+    recurso.colorId = color;
   }
 
-  return evento;
+  return Calendar.Events.insert(recurso, calendarId);
 }
 
 /**
  * Actualiza un evento existente para reflejar los datos actuales de la fila
- * (título, fecha/rango, descripción y color), pero solo llama a los métodos
- * de escritura de los campos que efectivamente cambiaron respecto al estado
- * actual del evento. Esto evita reescribir el evento completo en cada
- * sincronización cuando la fila no tuvo modificaciones.
+ * (título, fecha/rango, descripción y color). Se arma un objeto con
+ * únicamente los campos que efectivamente cambiaron respecto al estado
+ * actual del evento, y se aplica en una sola llamada patch, para no
+ * reescribir el evento completo en cada sincronización cuando la fila no
+ * tuvo modificaciones.
  *
- * @return {boolean} true si se modificó algún campo del evento.
+ * @return {{evento: Object, huboCambios: boolean}}
  */
-function actualizarEventoSiCorresponde(evento, titulo, fechaInfo, descripcion, color) {
-  let huboCambios = false;
+function actualizarEventoSiCorresponde(calendarId, evento, titulo, fechaInfo, descripcion, color) {
+  const cambios = {};
 
-  if (evento.getTitle() !== titulo) {
-    evento.setTitle(titulo);
-    huboCambios = true;
+  if ((evento.summary || '') !== titulo) {
+    cambios.summary = titulo;
   }
 
-  if (evento.getDescription() !== descripcion) {
-    evento.setDescription(descripcion);
-    huboCambios = true;
+  if ((evento.description || '') !== descripcion) {
+    cambios.description = descripcion;
   }
 
   if (fechasDistintas(evento, fechaInfo)) {
-    if (!fechaInfo.esRango) {
-      evento.setAllDayDate(fechaInfo.inicio);
-    } else {
-      const finExclusivo = sumarDias(fechaInfo.finInclusive, 1);
-      evento.setAllDayDates(fechaInfo.inicio, finExclusivo);
-    }
-    huboCambios = true;
+    const finExclusivo = sumarDias(fechaInfo.esRango ? fechaInfo.finInclusive : fechaInfo.inicio, 1);
+    cambios.start = { date: formatearClaveDia(fechaInfo.inicio) };
+    cambios.end = { date: formatearClaveDia(finExclusivo) };
   }
 
-  if (color && String(evento.getColor()) !== String(color)) {
-    evento.setColor(color);
-    huboCambios = true;
+  if (color && evento.colorId !== color) {
+    cambios.colorId = color;
   }
 
-  return huboCambios;
+  const huboCambios = Object.keys(cambios).length > 0;
+  const eventoActualizado = huboCambios ? Calendar.Events.patch(cambios, calendarId, evento.id) : evento;
+
+  return { evento: eventoActualizado, huboCambios };
 }
 
 /** true si la fecha/rango del evento no coincide con la que le corresponde según la planilla. */
 function fechasDistintas(evento, fechaInfo) {
-  if (!evento.isAllDayEvent()) return true;
+  if (!evento.start || !evento.start.date || !evento.end || !evento.end.date) return true;
 
   const finDeseadoExclusivo = sumarDias(fechaInfo.esRango ? fechaInfo.finInclusive : fechaInfo.inicio, 1);
   return (
-    !mismaFecha(evento.getAllDayStartDate(), fechaInfo.inicio) ||
-    !mismaFecha(evento.getAllDayEndDate(), finDeseadoExclusivo)
+    evento.start.date !== formatearClaveDia(fechaInfo.inicio) ||
+    evento.end.date !== formatearClaveDia(finDeseadoExclusivo)
   );
-}
-
-/** Compara dos fechas por año, mes y día, ignorando la hora. */
-function mismaFecha(a, b) {
-  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
 /** Devuelve una nueva fecha sumando N días a la fecha dada (no muta la original). */
@@ -644,7 +695,8 @@ function sumarDias(fecha, dias) {
   return nueva;
 }
 
-/** Genera una clave "aaaa-mm-dd" a partir de una fecha, usada como índice de día. */
+/** Genera una clave "aaaa-mm-dd" a partir de una fecha; se usa como índice de
+ *  día y también como formato de fecha que espera la Calendar API. */
 function formatearClaveDia(fecha) {
   return fecha.getFullYear() + '-' + dosDigitos(fecha.getMonth() + 1) + '-' + dosDigitos(fecha.getDate());
 }
